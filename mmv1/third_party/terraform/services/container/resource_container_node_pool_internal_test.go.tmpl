@@ -2,12 +2,14 @@ package container
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
 	transport_tpg "github.com/hashicorp/terraform-provider-google/google/transport"
 
 {{ if eq $.TargetVersionName `ga` }}
@@ -252,6 +254,76 @@ func TestUnitFlattenNodePool(t *testing.T) {
 
 			if diff := cmp.Diff(result["managed_instance_group_urls"], tc.expectedManagedIgmUrls); diff != "" {
 				t.Errorf("managed_instance_group_urls returned unexpected diff. +got, -want:\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestUnitExpandNodePoolNamePrefixLength guards against the node pool name
+// (name_prefix plus generated suffix) exceeding the GKE API's 40-character
+// limit on NodePool.name. See https://github.com/hashicorp/terraform-provider-google/issues/17504.
+func TestUnitExpandNodePoolNamePrefixLength(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		prefix     string
+		useReduced bool
+	}{
+		{name: "13-char prefix uses the full-length random suffix", prefix: strings.Repeat("a", 13), useReduced: false},
+		{name: "14-char prefix uses the shortened suffix", prefix: strings.Repeat("a", 14), useReduced: true},
+		{name: "30-char prefix (max allowed) uses the shortened suffix", prefix: strings.Repeat("a", 30), useReduced: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := schema.TestResourceDataRaw(t, schemaNodePool, map[string]interface{}{
+				"name_prefix": tc.prefix,
+			})
+
+			np, err := expandNodePool(d, "")
+			if err != nil {
+				t.Fatalf("expandNodePool() error = %v", err)
+			}
+
+			if len(np.Name) >= 40 {
+				t.Fatalf("expandNodePool() generated name %q with length %d, want < 40 (GKE API limit)", np.Name, len(np.Name))
+			}
+			if !strings.HasPrefix(np.Name, tc.prefix) {
+				t.Fatalf("expandNodePool() generated name %q does not start with prefix %q", np.Name, tc.prefix)
+			}
+
+			gotReduced := len(np.Name) == len(tc.prefix)+tpgresource.ReducedUniqueIdSuffixLength
+			if gotReduced != tc.useReduced {
+				t.Fatalf("expandNodePool() for prefix %q produced name %q (reduced suffix = %t), want reduced suffix = %t", tc.prefix, np.Name, gotReduced, tc.useReduced)
+			}
+		})
+	}
+}
+
+// TestUnitNamePrefixValidateFunc confirms name_prefix is capped at 30
+// characters, the longest prefix that combined with the shortened
+// suffix (tpgresource.ReducedUniqueIdSuffixLength) stays under the
+// GKE API's 40-character NodePool.name limit.
+func TestUnitNamePrefixValidateFunc(t *testing.T) {
+	t.Parallel()
+
+	validateFunc := schemaNodePool["name_prefix"].ValidateFunc
+
+	cases := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "30 characters is allowed", value: strings.Repeat("a", 30), wantErr: false},
+		{name: "31 characters is rejected", value: strings.Repeat("a", 31), wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, errs := validateFunc(tc.value, "name_prefix")
+			if gotErr := len(errs) > 0; gotErr != tc.wantErr {
+				t.Fatalf("ValidateFunc(%q) errs = %v, wantErr %t", tc.value, errs, tc.wantErr)
 			}
 		})
 	}
